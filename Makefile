@@ -1,29 +1,18 @@
-# Makefile for chef-server-mcp
-# Provides common developer workflows: build, test, lint, docker, etc.
-# Auto-detects a VERSION from git; falls back to 'dev' when not available.
-
+# Makefile for chef-server-mcp (MCP-only after HTTP removal)
 SHELL := /bin/bash
 GO    ?= go
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 DATE := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 LD_FLAGS := -s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=$(VERSION)
-BINARY_HTTP := chef-mcp
 BINARY_MCP  := mcp-chef
 BUILD_DIR := dist
 
-# Default target
 .PHONY: all
 all: build
 
 ## ---------- Build Targets ----------
 .PHONY: build
-build: build-http build-mcp ## Build both binaries
-
-.PHONY: build-http
-build-http: ## Build HTTP server binary
-	@mkdir -p $(BUILD_DIR)
-	$(GO) build -ldflags "$(LD_FLAGS)" -o $(BUILD_DIR)/$(BINARY_HTTP) ./cmd/chef-mcp
-	@echo "Built $(BUILD_DIR)/$(BINARY_HTTP) (version $(VERSION))"
+build: build-mcp ## Build MCP binary only
 
 .PHONY: build-mcp
 build-mcp: ## Build MCP (stdio JSON-RPC) binary
@@ -32,14 +21,6 @@ build-mcp: ## Build MCP (stdio JSON-RPC) binary
 	@echo "Built $(BUILD_DIR)/$(BINARY_MCP) (version $(VERSION))"
 
 ## ---------- Run / Dev ----------
-.PHONY: run
-run: build-http ## Run HTTP server (uses built binary)
-	./$(BUILD_DIR)/$(BINARY_HTTP)
-
-.PHONY: run-dev
-run-dev: ## Run HTTP server via 'go run'
-	$(GO) run ./cmd/chef-mcp
-
 .PHONY: run-mcp
 run-mcp: build-mcp ## Run MCP server (stdin/stdout JSON-RPC)
 	@echo "Starting MCP (press Ctrl+D or send exit method to quit)" >&2
@@ -47,7 +28,7 @@ run-mcp: build-mcp ## Run MCP server (stdin/stdout JSON-RPC)
 
 ## ---------- Testing & Lint ----------
 .PHONY: test
-test: ## Run unit tests with race detector
+test: ## Run unit tests (none currently after HTTP removal except package-level)
 	$(GO) test -race -count=1 ./...
 
 .PHONY: cover
@@ -74,7 +55,7 @@ IMAGE ?= ghcr.io/aknarts/chef-server-mcp
 PLATFORMS ?= linux/amd64
 
 .PHONY: docker-build
-docker-build: ## Build docker image (single-arch)
+docker-build: ## Build docker image (single-arch) containing only mcp-chef
 	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(VERSION) -t $(IMAGE):latest .
 
 .PHONY: docker-push
@@ -103,4 +84,3 @@ help: ## Show this help
 	grep -E '^[a-zA-Z0-9_-]+:.*?##' $(MAKEFILE_LIST) | sed -E 's/:.*?##/\t/' | sort
 
 # End of Makefile
-
