@@ -33,9 +33,8 @@ jobs:
       - name: Go Vet
         run: go vet ./...
 
-      - name: Build (HTTP + MCP)
+      - name: Build MCP Server
         run: |
-          go build -v -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.sha }}" -o chef-mcp ./cmd/chef-mcp
           go build -v -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.sha }}" -o mcp-chef ./cmd/mcp-chef
 
       - name: Tests
@@ -49,7 +48,7 @@ jobs:
 
       - name: Build Docker image (no push)
         run: |
-          docker build --build-arg VERSION=${{ github.sha }} -t local/chef-mcp:${{ github.sha }} .
+          docker build --build-arg VERSION=${{ github.sha }} -t local/mcp-chef:${{ github.sha }} .
 
   docker-publish:
     needs: build-test
@@ -61,6 +60,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
 
       - name: Setup QEMU
         uses: docker/setup-qemu-action@v3
@@ -75,6 +80,15 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
       - name: Build and push (multi-arch)
         uses: docker/build-push-action@v5
         with:
@@ -82,16 +96,15 @@ jobs:
           push: true
           build-args: |
             VERSION=${{ github.ref_name }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Build release binaries
         run: |
-          go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o chef-mcp ./cmd/chef-mcp
           go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o mcp-chef ./cmd/mcp-chef
-          tar -czf chef-mcp_${{ github.ref_name }}_linux_amd64.tar.gz chef-mcp
           tar -czf mcp-chef_${{ github.ref_name }}_linux_amd64.tar.gz mcp-chef
         shell: bash
       - name: Upload release artifacts
@@ -99,5 +112,4 @@ jobs:
         with:
           name: release-binaries
           path: |
-            chef-mcp_*_linux_amd64.tar.gz
             mcp-chef_*_linux_amd64.tar.gz
