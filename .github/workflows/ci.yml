@@ -98,18 +98,25 @@ jobs:
             VERSION=${{ github.ref_name }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Build release binaries
         run: |
-          go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o mcp-chef ./cmd/mcp-chef
-          tar -czf mcp-chef_${{ github.ref_name }}_linux_amd64.tar.gz mcp-chef
+          # Build for multiple architectures
+          GOOS=linux GOARCH=amd64 go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o mcp-chef-linux-amd64 ./cmd/mcp-chef
+          GOOS=linux GOARCH=arm64 go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o mcp-chef-linux-arm64 ./cmd/mcp-chef
+          GOOS=linux GOARCH=arm go build -ldflags "-s -w -X github.com/aknarts/chef-server-mcp/internal/version.Version=${{ github.ref_name }}" -o mcp-chef-linux-arm ./cmd/mcp-chef
+          
+          # Create tarballs
+          tar -czf mcp-chef_${{ github.ref_name }}_linux_amd64.tar.gz mcp-chef-linux-amd64
+          tar -czf mcp-chef_${{ github.ref_name }}_linux_arm64.tar.gz mcp-chef-linux-arm64
+          tar -czf mcp-chef_${{ github.ref_name }}_linux_arm.tar.gz mcp-chef-linux-arm
         shell: bash
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-binaries
           path: |
-            mcp-chef_*_linux_amd64.tar.gz
+            mcp-chef_*_linux_*.tar.gz

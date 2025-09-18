@@ -14,20 +14,6 @@ A Model Context Protocol (MCP) server that provides AI assistants with read-only
 - **Docker-based deployment** for easy installation
 - **MCP protocol compliance** for seamless AI assistant integration
 
-## Installation
-
-### Using Docker (Recommended)
-
-Pull the latest image from GitHub Container Registry:
-
-```bash
-docker pull ghcr.io/aknarts/chef-server-mcp:latest
-```
-
-### Using Pre-built Binaries
-
-Download the latest release from the [releases page](https://github.com/aknarts/chef-server-mcp/releases).
-
 ## Configuration
 
 ### Environment Variables
