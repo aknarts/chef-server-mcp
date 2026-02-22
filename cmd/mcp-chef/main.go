@@ -1,7 +1,10 @@
 package main
 
-// Re-implemented using the official Model Context Protocol Go SDK.
-// Knife fallback removed. All tools require valid Chef API credentials.
+// MCP server providing read-only access to Chef Server resources.
+// All tools are enforced read-only at multiple layers:
+//   1. MCP ToolAnnotations (ReadOnlyHint: true) — signals to clients
+//   2. ChefReader interface — compile-time enforcement in chefapi
+//   3. ReadOnlyTransport — runtime HTTP method blocking in safeclient
 
 import (
 	"context"
@@ -21,21 +24,25 @@ import (
 	"github.com/aknarts/chef-server-mcp/internal/version"
 )
 
-// ListNodesInput intentionally empty (no arguments needed)
-type ListNodesInput struct{}
-
-// ListNodesOutput provides a structured response for the tool.
-type ListNodesOutput struct {
-	Nodes []string `json:"nodes" jsonschema:"List of Chef node names"`
+// readOnlyAnnotations returns MCP tool annotations indicating a read-only,
+// non-destructive, open-world (network-accessing) tool.
+func readOnlyAnnotations() *mcp.ToolAnnotations {
+	destructive := false
+	openWorld := true
+	return &mcp.ToolAnnotations{
+		ReadOnlyHint:    true,
+		DestructiveHint: &destructive,
+		IdempotentHint:  true,
+		OpenWorldHint:   &openWorld,
+	}
 }
 
-// Additional tool input/output structs
+// Tool input/output types — all tools accept optional organization parameter
 
-// ListNodesInput now supports optional organization parameter
-type ListNodesInputWithOrg struct {
+type ListNodesInput struct {
 	Organization *string `json:"organization,omitempty"`
 }
-type ListNodesOutputWithOrg struct {
+type ListNodesOutput struct {
 	Nodes        []string `json:"nodes"`
 	Organization string   `json:"organization"`
 }
@@ -88,7 +95,6 @@ type SearchInput struct {
 	Query        string  `json:"query"`
 	Organization *string `json:"organization,omitempty"`
 }
-
 type SearchOutput struct {
 	Total        int           `json:"total"`
 	Start        int           `json:"start"`
@@ -101,7 +107,6 @@ type SearchJSONInput struct {
 	Query        string  `json:"query"`
 	Organization *string `json:"organization,omitempty"`
 }
-
 type SearchJSONOutput struct {
 	Total        int               `json:"total"`
 	Start        int               `json:"start"`
@@ -109,7 +114,6 @@ type SearchJSONOutput struct {
 	Organization string            `json:"organization"`
 }
 
-// New tool types for additional Chef resources
 type GetOrganizationInput struct {
 	Organization *string `json:"organization,omitempty"`
 }
@@ -132,8 +136,8 @@ type GetCookbookInput struct {
 	Organization *string `json:"organization,omitempty"`
 }
 type GetCookbookOutput struct {
-	Cookbook     *chef.Cookbook `json:"cookbook"`
-	Organization string         `json:"organization"`
+	Cookbook      *chef.Cookbook `json:"cookbook"`
+	Organization string        `json:"organization"`
 }
 
 type ListDataBagsInput struct {
@@ -182,17 +186,33 @@ type GetEnvironmentOutput struct {
 	Organization string            `json:"organization"`
 }
 
+type ListClientsInput struct {
+	Organization *string `json:"organization,omitempty"`
+}
+type ListClientsOutput struct {
+	Clients      []string `json:"clients"`
+	Organization string   `json:"organization"`
+}
+
+type GetClientInput struct {
+	Name         string  `json:"name"`
+	Organization *string `json:"organization,omitempty"`
+}
+type GetClientOutput struct {
+	Client       *chef.ApiClient `json:"client"`
+	Organization string          `json:"organization"`
+}
+
 func main() {
 	log.SetOutput(os.Stderr)
 	cfg := config.LoadFromEnv()
-	log.Printf("mcp-chef starting version=%s (knife fallback removed)", version.Version)
+	log.Printf("mcp-chef starting version=%s (read-only enforced)", version.Version)
 
-	// Require Chef API credentials now (no fallback mode)
+	// Require Chef API credentials (no fallback mode)
 	if cfg.ChefUser == "" || cfg.ChefKeyPath == "" || cfg.ChefServerURL == "" {
 		log.Fatalf("Chef API credentials incomplete: need CHEF_USER, CHEF_KEY_PATH, CHEF_SERVER_URL")
 	}
 
-	// Warn if no default organization is set
 	if cfg.DefaultOrg == "" {
 		log.Printf("Warning: CHEF_DEFAULT_ORG not set. Organization must be specified in each request.")
 	}
@@ -205,14 +225,16 @@ func main() {
 	impl := &mcp.Implementation{Name: "chef-server-mcp", Version: version.Version}
 	server := mcp.NewServer(impl, nil)
 
-	needAPI := func() (*chefapi.ChefAPI, error) {
-		if chefClient == nil {
+	// Use ChefReader interface to enforce read-only at compile time
+	var api chefapi.ChefReader = chefClient
+
+	needAPI := func() (chefapi.ChefReader, error) {
+		if api == nil {
 			return nil, errors.New("Chef API client not initialized")
 		}
-		return chefClient, nil
+		return api, nil
 	}
 
-	// Helper function to safely get string value from pointer
 	getOrgString := func(orgPtr *string) string {
 		if orgPtr == nil {
 			return ""
@@ -220,361 +242,401 @@ func main() {
 		return *orgPtr
 	}
 
-	// listNodes tool (API only) - now supports organization parameter
+	annotations := readOnlyAnnotations()
+
+	// listNodes
 	mcp.AddTool(server, &mcp.Tool{
 		Name:        "listNodes",
-		Description: "List Chef node names (Chef API) - optionally specify organization",
-	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListNodesInputWithOrg) (*mcp.CallToolResult, ListNodesOutputWithOrg, error) {
-		api, err := needAPI()
+		Description: "List Chef node names - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListNodesInput) (*mcp.CallToolResult, ListNodesOutput, error) {
+		a, err := needAPI()
 		if err != nil {
-			return nil, ListNodesOutputWithOrg{}, err
+			return nil, ListNodesOutput{}, err
 		}
-
-		// Resolve organization (use default if not specified)
 		org := cfg.ResolveOrganization(getOrgString(in.Organization))
 		if org == "" {
-			return nil, ListNodesOutputWithOrg{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+			return nil, ListNodesOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
 		}
-
-		nodes, err := api.ListNodes(org)
+		nodes, err := a.ListNodes(org)
 		if err != nil {
-			return nil, ListNodesOutputWithOrg{}, err
+			return nil, ListNodesOutput{}, err
 		}
-		return nil, ListNodesOutputWithOrg{Nodes: nodes, Organization: org}, nil
+		return nil, ListNodesOutput{Nodes: nodes, Organization: org}, nil
 	})
 
 	// getNode
-	mcp.AddTool(server, &mcp.Tool{Name: "getNode", Description: "Get a single Chef node by name - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetNodeInput) (*mcp.CallToolResult, GetNodeOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetNodeOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetNodeOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			n, err := api.GetNode(in.Name, org)
-			if err != nil {
-				return nil, GetNodeOutput{}, err
-			}
-			return nil, GetNodeOutput{Node: n, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getNode",
+		Description: "Get a single Chef node by name - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetNodeInput) (*mcp.CallToolResult, GetNodeOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetNodeOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetNodeOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		n, err := a.GetNode(in.Name, org)
+		if err != nil {
+			return nil, GetNodeOutput{}, err
+		}
+		return nil, GetNodeOutput{Node: n, Organization: org}, nil
+	})
 
 	// listRoles
-	mcp.AddTool(server, &mcp.Tool{Name: "listRoles", Description: "List Chef role names - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListRolesInput) (*mcp.CallToolResult, ListRolesOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListRolesOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListRolesOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			roles, err := api.ListRoles(org)
-			if err != nil {
-				return nil, ListRolesOutput{}, err
-			}
-			return nil, ListRolesOutput{Roles: roles, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listRoles",
+		Description: "List Chef role names - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListRolesInput) (*mcp.CallToolResult, ListRolesOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListRolesOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListRolesOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		roles, err := a.ListRoles(org)
+		if err != nil {
+			return nil, ListRolesOutput{}, err
+		}
+		return nil, ListRolesOutput{Roles: roles, Organization: org}, nil
+	})
 
 	// getRole
-	mcp.AddTool(server, &mcp.Tool{Name: "getRole", Description: "Get a single Chef role by name - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetRoleInput) (*mcp.CallToolResult, GetRoleOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetRoleOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetRoleOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			r, err := api.GetRole(in.Name, org)
-			if err != nil {
-				return nil, GetRoleOutput{}, err
-			}
-			return nil, GetRoleOutput{Role: r, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getRole",
+		Description: "Get a single Chef role by name - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetRoleInput) (*mcp.CallToolResult, GetRoleOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetRoleOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetRoleOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		r, err := a.GetRole(in.Name, org)
+		if err != nil {
+			return nil, GetRoleOutput{}, err
+		}
+		return nil, GetRoleOutput{Role: r, Organization: org}, nil
+	})
 
 	// listUsers
-	mcp.AddTool(server, &mcp.Tool{Name: "listUsers", Description: "List Chef user names - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListUsersInput) (*mcp.CallToolResult, ListUsersOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListUsersOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListUsersOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			users, err := api.ListUsers(org)
-			if err != nil {
-				return nil, ListUsersOutput{}, err
-			}
-			return nil, ListUsersOutput{Users: users, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listUsers",
+		Description: "List Chef user names - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListUsersInput) (*mcp.CallToolResult, ListUsersOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListUsersOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListUsersOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		users, err := a.ListUsers(org)
+		if err != nil {
+			return nil, ListUsersOutput{}, err
+		}
+		return nil, ListUsersOutput{Users: users, Organization: org}, nil
+	})
 
 	// getUser
-	mcp.AddTool(server, &mcp.Tool{Name: "getUser", Description: "Get a single Chef user by name - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetUserInput) (*mcp.CallToolResult, GetUserOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetUserOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetUserOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			u, err := api.GetUser(in.Name, org)
-			if err != nil {
-				return nil, GetUserOutput{}, err
-			}
-			return nil, GetUserOutput{User: u, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getUser",
+		Description: "Get a single Chef user by name - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetUserInput) (*mcp.CallToolResult, GetUserOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetUserOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetUserOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		u, err := a.GetUser(in.Name, org)
+		if err != nil {
+			return nil, GetUserOutput{}, err
+		}
+		return nil, GetUserOutput{User: u, Organization: org}, nil
+	})
 
 	// search
-	mcp.AddTool(server, &mcp.Tool{Name: "search", Description: "Execute a Chef search and return decoded rows - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, SearchOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, SearchOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			res, err := api.Search(in.Index, in.Query, org)
-			if err != nil {
-				return nil, SearchOutput{}, err
-			}
-			return nil, SearchOutput{Total: res.Total, Start: res.Start, Rows: res.Rows, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "search",
+		Description: "Execute a Chef search and return decoded rows - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in SearchInput) (*mcp.CallToolResult, SearchOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, SearchOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, SearchOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		res, err := a.Search(in.Index, in.Query, org)
+		if err != nil {
+			return nil, SearchOutput{}, err
+		}
+		return nil, SearchOutput{Total: res.Total, Start: res.Start, Rows: res.Rows, Organization: org}, nil
+	})
 
 	// searchJSON
-	mcp.AddTool(server, &mcp.Tool{Name: "searchJSON", Description: "Execute a Chef search and return raw JSON rows - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in SearchJSONInput) (*mcp.CallToolResult, SearchJSONOutput, error) {
-			api, err := needAPI()
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "searchJSON",
+		Description: "Execute a Chef search and return raw JSON rows - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in SearchJSONInput) (*mcp.CallToolResult, SearchJSONOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, SearchJSONOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, SearchJSONOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		res, err := a.SearchJSON(in.Index, in.Query, org)
+		if err != nil {
+			return nil, SearchJSONOutput{}, err
+		}
+		rows := make([]json.RawMessage, 0, len(res.Rows))
+		for _, r := range res.Rows {
+			b, err := json.Marshal(r)
 			if err != nil {
 				return nil, SearchJSONOutput{}, err
 			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, SearchJSONOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			res, err := api.SearchJSON(in.Index, in.Query, org)
-			if err != nil {
-				return nil, SearchJSONOutput{}, err
-			}
-			rows := make([]json.RawMessage, 0, len(res.Rows))
-			for _, r := range res.Rows { // marshal each row back to raw JSON blob
-				b, err := json.Marshal(r)
-				if err != nil {
-					return nil, SearchJSONOutput{}, err
-				}
-				rows = append(rows, b)
-			}
-			return nil, SearchJSONOutput{Total: res.Total, Start: res.Start, Rows: rows, Organization: org}, nil
-		})
+			rows = append(rows, b)
+		}
+		return nil, SearchJSONOutput{Total: res.Total, Start: res.Start, Rows: rows, Organization: org}, nil
+	})
 
 	// getOrganization
-	mcp.AddTool(server, &mcp.Tool{Name: "getOrganization", Description: "Get organization details - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetOrganizationInput) (*mcp.CallToolResult, GetOrganizationOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetOrganizationOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetOrganizationOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			orgDetails, err := api.GetOrganization(org)
-			if err != nil {
-				return nil, GetOrganizationOutput{}, err
-			}
-			return nil, GetOrganizationOutput{Organization: orgDetails, OrgName: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getOrganization",
+		Description: "Get organization details - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetOrganizationInput) (*mcp.CallToolResult, GetOrganizationOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetOrganizationOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetOrganizationOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		orgDetails, err := a.GetOrganization(org)
+		if err != nil {
+			return nil, GetOrganizationOutput{}, err
+		}
+		return nil, GetOrganizationOutput{Organization: orgDetails, OrgName: org}, nil
+	})
 
 	// listCookbooks
-	mcp.AddTool(server, &mcp.Tool{Name: "listCookbooks", Description: "List Chef cookbooks and their versions - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListCookbooksInput) (*mcp.CallToolResult, ListCookbooksOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListCookbooksOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListCookbooksOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			cookbooks, err := api.ListCookbooks(org)
-			if err != nil {
-				return nil, ListCookbooksOutput{}, err
-			}
-			return nil, ListCookbooksOutput{Cookbooks: cookbooks, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listCookbooks",
+		Description: "List Chef cookbooks and their versions - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListCookbooksInput) (*mcp.CallToolResult, ListCookbooksOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListCookbooksOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListCookbooksOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		cookbooks, err := a.ListCookbooks(org)
+		if err != nil {
+			return nil, ListCookbooksOutput{}, err
+		}
+		return nil, ListCookbooksOutput{Cookbooks: cookbooks, Organization: org}, nil
+	})
 
 	// getCookbook
-	mcp.AddTool(server, &mcp.Tool{Name: "getCookbook", Description: "Get a Chef cookbook by name and version (defaults to _latest) - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetCookbookInput) (*mcp.CallToolResult, GetCookbookOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetCookbookOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetCookbookOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			version := "_latest"
-			if in.Version != nil && *in.Version != "" {
-				version = *in.Version
-			}
-
-			cookbook, err := api.GetCookbook(in.Name, version, org)
-			if err != nil {
-				return nil, GetCookbookOutput{}, err
-			}
-			return nil, GetCookbookOutput{Cookbook: cookbook, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getCookbook",
+		Description: "Get a Chef cookbook by name and version (defaults to _latest) - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetCookbookInput) (*mcp.CallToolResult, GetCookbookOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetCookbookOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetCookbookOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		ver := "_latest"
+		if in.Version != nil && *in.Version != "" {
+			ver = *in.Version
+		}
+		cookbook, err := a.GetCookbook(in.Name, ver, org)
+		if err != nil {
+			return nil, GetCookbookOutput{}, err
+		}
+		return nil, GetCookbookOutput{Cookbook: cookbook, Organization: org}, nil
+	})
 
 	// listDataBags
-	mcp.AddTool(server, &mcp.Tool{Name: "listDataBags", Description: "List Chef data bags - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListDataBagsInput) (*mcp.CallToolResult, ListDataBagsOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListDataBagsOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListDataBagsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			dataBags, err := api.ListDataBags(org)
-			if err != nil {
-				return nil, ListDataBagsOutput{}, err
-			}
-			return nil, ListDataBagsOutput{DataBags: dataBags, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listDataBags",
+		Description: "List Chef data bags - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListDataBagsInput) (*mcp.CallToolResult, ListDataBagsOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListDataBagsOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListDataBagsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		dataBags, err := a.ListDataBags(org)
+		if err != nil {
+			return nil, ListDataBagsOutput{}, err
+		}
+		return nil, ListDataBagsOutput{DataBags: dataBags, Organization: org}, nil
+	})
 
 	// listDataBagItems
-	mcp.AddTool(server, &mcp.Tool{Name: "listDataBagItems", Description: "List items in a Chef data bag - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListDataBagItemsInput) (*mcp.CallToolResult, ListDataBagItemsOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListDataBagItemsOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListDataBagItemsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			items, err := api.ListDataBagItems(in.Name, org)
-			if err != nil {
-				return nil, ListDataBagItemsOutput{}, err
-			}
-			return nil, ListDataBagItemsOutput{Items: items, DataBag: in.Name, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listDataBagItems",
+		Description: "List items in a Chef data bag - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListDataBagItemsInput) (*mcp.CallToolResult, ListDataBagItemsOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListDataBagItemsOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListDataBagItemsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		items, err := a.ListDataBagItems(in.Name, org)
+		if err != nil {
+			return nil, ListDataBagItemsOutput{}, err
+		}
+		return nil, ListDataBagItemsOutput{Items: items, DataBag: in.Name, Organization: org}, nil
+	})
 
 	// getDataBagItem
-	mcp.AddTool(server, &mcp.Tool{Name: "getDataBagItem", Description: "Get a specific item from a Chef data bag - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetDataBagItemInput) (*mcp.CallToolResult, GetDataBagItemOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetDataBagItemOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetDataBagItemOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			item, err := api.GetDataBagItem(in.BagName, in.ItemName, org)
-			if err != nil {
-				return nil, GetDataBagItemOutput{}, err
-			}
-			return nil, GetDataBagItemOutput{Item: item, DataBag: in.BagName, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getDataBagItem",
+		Description: "Get a specific item from a Chef data bag - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetDataBagItemInput) (*mcp.CallToolResult, GetDataBagItemOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetDataBagItemOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetDataBagItemOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		item, err := a.GetDataBagItem(in.BagName, in.ItemName, org)
+		if err != nil {
+			return nil, GetDataBagItemOutput{}, err
+		}
+		return nil, GetDataBagItemOutput{Item: item, DataBag: in.BagName, Organization: org}, nil
+	})
 
 	// listEnvironments
-	mcp.AddTool(server, &mcp.Tool{Name: "listEnvironments", Description: "List Chef environments - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in ListEnvironmentsInput) (*mcp.CallToolResult, ListEnvironmentsOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, ListEnvironmentsOutput{}, err
-			}
-
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, ListEnvironmentsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
-
-			environments, err := api.ListEnvironments(org)
-			if err != nil {
-				return nil, ListEnvironmentsOutput{}, err
-			}
-			return nil, ListEnvironmentsOutput{Environments: environments, Organization: org}, nil
-		})
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listEnvironments",
+		Description: "List Chef environments - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListEnvironmentsInput) (*mcp.CallToolResult, ListEnvironmentsOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListEnvironmentsOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListEnvironmentsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		environments, err := a.ListEnvironments(org)
+		if err != nil {
+			return nil, ListEnvironmentsOutput{}, err
+		}
+		return nil, ListEnvironmentsOutput{Environments: environments, Organization: org}, nil
+	})
 
 	// getEnvironment
-	mcp.AddTool(server, &mcp.Tool{Name: "getEnvironment", Description: "Get a Chef environment by name - optionally specify organization"},
-		func(ctx context.Context, req *mcp.CallToolRequest, in GetEnvironmentInput) (*mcp.CallToolResult, GetEnvironmentOutput, error) {
-			api, err := needAPI()
-			if err != nil {
-				return nil, GetEnvironmentOutput{}, err
-			}
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getEnvironment",
+		Description: "Get a Chef environment by name - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetEnvironmentInput) (*mcp.CallToolResult, GetEnvironmentOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetEnvironmentOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetEnvironmentOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		environment, err := a.GetEnvironment(in.Name, org)
+		if err != nil {
+			return nil, GetEnvironmentOutput{}, err
+		}
+		return nil, GetEnvironmentOutput{Environment: environment, Organization: org}, nil
+	})
 
-			// Resolve organization
-			org := cfg.ResolveOrganization(getOrgString(in.Organization))
-			if org == "" {
-				return nil, GetEnvironmentOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
-			}
+	// listClients
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "listClients",
+		Description: "List Chef API client names - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in ListClientsInput) (*mcp.CallToolResult, ListClientsOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, ListClientsOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, ListClientsOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		clients, err := a.ListClients(org)
+		if err != nil {
+			return nil, ListClientsOutput{}, err
+		}
+		return nil, ListClientsOutput{Clients: clients, Organization: org}, nil
+	})
 
-			environment, err := api.GetEnvironment(in.Name, org)
-			if err != nil {
-				return nil, GetEnvironmentOutput{}, err
-			}
-			return nil, GetEnvironmentOutput{Environment: environment, Organization: org}, nil
-		})
+	// getClient
+	mcp.AddTool(server, &mcp.Tool{
+		Name:        "getClient",
+		Description: "Get a Chef API client by name - optionally specify organization",
+		Annotations: annotations,
+	}, func(ctx context.Context, req *mcp.CallToolRequest, in GetClientInput) (*mcp.CallToolResult, GetClientOutput, error) {
+		a, err := needAPI()
+		if err != nil {
+			return nil, GetClientOutput{}, err
+		}
+		org := cfg.ResolveOrganization(getOrgString(in.Organization))
+		if org == "" {
+			return nil, GetClientOutput{}, fmt.Errorf("organization must be specified or CHEF_DEFAULT_ORG must be set")
+		}
+		c, err := a.GetClient(in.Name, org)
+		if err != nil {
+			return nil, GetClientOutput{}, err
+		}
+		return nil, GetClientOutput{Client: c, Organization: org}, nil
+	})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Allow graceful cancel on SIGINT/SIGTERM while letting host manage stdio session.
 	go func() {
 		ch := make(chan os.Signal, 1)
 		signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
